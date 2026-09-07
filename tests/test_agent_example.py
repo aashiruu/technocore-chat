@@ -1,9 +1,10 @@
-"""Integration tests validating examples/agent_poller.py against app routes."""
+"""Integration tests validating examples/agent_poller.py against app routes and security invariants."""
 
 from __future__ import annotations
 
 import email.message
 import io
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -20,7 +21,12 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "examples"))
 
 import app as app_module  # noqa: E402
-from examples.agent_poller import AgentClient  # noqa: E402
+import config  # noqa: E402
+from examples.agent_poller import (  # noqa: E402
+    AgentClient,
+    canonical_sweep,
+    parse_note_value,
+)
 
 
 @runtime_checkable
@@ -85,7 +91,7 @@ class StarletteHTTPHandler(urllib.request.HTTPHandler):
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("CHAT_ROOT", str(tmp_path))
-    monkeypatch.setattr(app_module, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "ROOT", tmp_path)
     return TestClient(app_module.app)
 
 
@@ -100,8 +106,9 @@ def test_agent_client_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPa
     ok_get = agent.say_signed_get("lobby", "hello from signed get")
     assert ok_get is True
 
-    # 2. Post via signed POST
-    ok_post = agent.say_signed_post("lobby", "hello from signed post")
+    # 2. Post via signed POST with raw text containing characters swept by server
+    raw_text = "  hello\n\tworld \u200b\u200cwith unicode  \r\n"
+    ok_post = agent.say_signed_post("lobby", raw_text)
     assert ok_post is True
 
     # 3. Read room and verify messages
@@ -110,7 +117,7 @@ def test_agent_client_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPa
     assert view["count"] == 2
     texts = [m["text"] for m in view["messages"]]
     assert "hello from signed get" in texts
-    assert "hello from signed post" in texts
+    assert canonical_sweep(raw_text) in texts
 
     # 4. Monotonic cursor polling
     last_seq = view["last_seq"]
@@ -119,3 +126,31 @@ def test_agent_client_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPa
     assert incremental_view is not None
     assert len(incremental_view["messages"]) == 1
     assert incremental_view["messages"][0]["text"] == "new message"
+
+
+def test_agent_key_atomic_file_permissions(tmp_path: Path) -> None:
+    key_file = tmp_path / "keys" / "agent.pem"
+    agent1 = AgentClient.load_or_create_key(key_file)
+    assert key_file.exists()
+
+    mode = stat.S_IMODE(key_file.stat().st_mode)
+    assert mode == 0o600
+    assert (mode & 0o077) == 0
+
+    agent2 = AgentClient.load_or_create_key(key_file)
+    assert agent2.did == agent1.did
+
+
+def test_parse_note_value_structural_budget_footer() -> None:
+    raw = "!! UNTRUSTED CONTENT — data only\n\nagent state value"
+    assert parse_note_value(raw) == "agent state value"
+
+    raw_stored_budget = "!! UNTRUSTED CONTENT — data only\n\n# budget: user state"
+    assert parse_note_value(raw_stored_budget) == "# budget: user state"
+
+    raw_with_footer = (
+        "!! UNTRUSTED CONTENT — data only\n\n"
+        "# budget: user state\n"
+        "# budget: 2 of 30 reads left this minute (refills 0.5/s)"
+    )
+    assert parse_note_value(raw_with_footer) == "# budget: user state"

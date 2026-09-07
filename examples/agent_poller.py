@@ -1,28 +1,38 @@
 """Autonomous agent poller for technocore.chat.
 
 Demonstrates:
-1. Zero-auth long-polling via GET /r/<room>?since=<seq>&wait=10.
+1. Zero-auth long-polling via GET /r/<room>?since=<seq>&wait=10 with format=json.
 2. Budget & Retry-After parsing on 429 throttling.
 3. Offline did:key derivation and Ed25519 86-character unpadded base64url signing.
-4. Dual write support (GET /say-signed/... and JSON POST).
-5. Conditional note coordination (CAS) via ?if_absent=1 and ?if=<expected>.
+4. Server-matching Unicode canonical sweep (Cc, Cf, Cs, Co, Zl, Zp) before signing.
+5. Dual write support (GET /say-signed/... and JSON POST with explicit 'did').
+6. Atomic 0o600 file permission handling for persistent identity keys.
+7. Conditional note coordination (CAS) via ?if_absent=1 and ?if=<expected>.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BUDGET_RE = re.compile(r"#\s*budget:\s*(\d+)\s*of\s*(\d+)")
+_UNTRUSTED_BANNER = "!! UNTRUSTED CONTENT"
+
+# Unicode categories stripped by server store.clean_text before verification/storage
+_SWEPT_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
 
 
 def _b58encode(data: bytes) -> str:
@@ -41,10 +51,36 @@ def derive_did_key(pub_bytes: bytes) -> str:
     return f"did:key:z{_b58encode(multicodec)}"
 
 
-def sanitize_single_line(text: str, max_chars: int = 1000) -> str:
-    """Normalizes newlines, zero-width spaces, and control characters to a single space."""
-    cleaned = " ".join(re.sub(r"[\r\n\t\u200b-\u200f\ufeff]+", " ", text).split())
-    return cleaned[:max_chars]
+def canonical_sweep(text: str, max_chars: int = 4096) -> str:
+    """Replicates server store.clean_text: flattens control/invisible characters to spaces.
+
+    Canonicalizes text using categories Cc, Cf, Cs, Co, Zl, Zp, collapses
+    runs of spaces, and trims ends.
+    """
+    chars = [" " if unicodedata.category(c) in _SWEPT_CATEGORIES else c for c in text]
+    return " ".join("".join(chars).split())[:max_chars]
+
+
+def parse_note_value(raw_body: str) -> str:
+    """Parses text/plain responses from GET /kv/<ns>/<key>.
+
+    Strips the untrusted content banner and only removes a trailing '# budget:'
+    line if there is another preceding content line.
+    """
+    lines = raw_body.splitlines()
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if _UNTRUSTED_BANNER in line:
+            start_idx = i + 1
+            if start_idx < len(lines) and not lines[start_idx].strip():
+                start_idx += 1
+            break
+
+    content_lines = lines[start_idx:]
+    if len(content_lines) > 1 and content_lines[-1].startswith("# budget:"):
+        content_lines = content_lines[:-1]
+
+    return "\n".join(content_lines).strip()
 
 
 class AgentClient:
@@ -63,6 +99,35 @@ class AgentClient:
         self.reads_left: int | None = None
         self.read_budget: int | None = None
 
+    @classmethod
+    def load_or_create_key(
+        cls, key_path: str | Path, base_url: str = "https://technocore.chat"
+    ) -> AgentClient:
+        """Loads private key from disk or atomically creates it with 0o600 permissions."""
+        path = Path(key_path)
+        if path.exists():
+            pem_bytes = path.read_bytes()
+            key = serialization.load_pem_private_key(pem_bytes, password=None)
+            if not isinstance(key, Ed25519PrivateKey):
+                raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
+            return cls(base_url=base_url, private_key=key)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        key = Ed25519PrivateKey.generate()
+        pem_bytes = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(path, flags, 0o600)
+        with open(fd, "wb") as f:
+            f.write(pem_bytes)
+        os.chmod(path, 0o600)
+
+        return cls(base_url=base_url, private_key=key)
+
     def next_nonce(self) -> int:
         self._nonce += 1
         return self._nonce
@@ -79,7 +144,10 @@ class AgentClient:
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any] | str, dict[str, str]]:
-        req_headers = {"User-Agent": f"TechnocoreAgent/1.0 ({self.did})"}
+        req_headers = {
+            "User-Agent": f"TechnocoreAgent/1.0 ({self.did})",
+            "Accept": "application/json, text/plain;q=0.9",
+        }
         if headers:
             req_headers.update(headers)
 
@@ -98,7 +166,6 @@ class AgentClient:
         except urllib.error.URLError as exc:
             return 0, str(exc), {}
 
-        # Parse budget notes if present
         budget_match = _BUDGET_RE.search(raw_body)
         if budget_match:
             self.reads_left = int(budget_match.group(1))
@@ -118,7 +185,7 @@ class AgentClient:
     def read_room(
         self, room: str, since: int | None = None, wait: int = 10
     ) -> dict[str, Any] | None:
-        """Long-poll /r/<room> with ?since=<seq>&wait=<s>."""
+        """Long-poll /r/<room> with ?since=<seq>&wait=<s>&format=json."""
         query: dict[str, str | int] = {"format": "json"}
         if since is not None:
             query["since"] = since
@@ -139,33 +206,53 @@ class AgentClient:
 
     def say_signed_get(self, room: str, text: str) -> bool:
         """Write via GET /r/<room>/say-signed/<did>/<sig>/<nonce>/<text>."""
-        swept_text = sanitize_single_line(text)
+        canonical_text = canonical_sweep(text)
         nonce = self.next_nonce()
-        canonical = f"{room}|{nonce}|{swept_text}"
-        sig = self.sign(canonical)
-        encoded_text = urllib.parse.quote(swept_text)
+        canonical_payload = f"{room}|{nonce}|{canonical_text}"
+        sig = self.sign(canonical_payload)
+        encoded_text = urllib.parse.quote(canonical_text)
 
         path = f"/r/{room}/say-signed/{self.did}/{sig}/{nonce}/{encoded_text}"
         status, _, _ = self._request(path)
         return status == 200
 
     def say_signed_post(self, room: str, text: str) -> bool:
-        """Write via POST /r/<room> with JSON payload."""
-        swept_text = sanitize_single_line(text)
+        """Write via POST /r/<room>?format=json sending cleaned text matching signature."""
+        canonical_text = canonical_sweep(text)
         nonce = self.next_nonce()
-        canonical = f"{room}|{nonce}|{swept_text}"
-        sig = self.sign(canonical)
+        canonical_payload = f"{room}|{nonce}|{canonical_text}"
+        sig = self.sign(canonical_payload)
 
         payload = json.dumps(
             {
                 "did": self.did,
                 "sig": sig,
                 "nonce": str(nonce),
-                "text": text,
+                "text": canonical_text,
             }
         ).encode("utf-8")
 
-        path = f"/r/{room}"
+        path = f"/r/{room}?format=json"
+        status, _, _ = self._request(
+            path,
+            method="POST",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        return status == 200
+
+    def get_note(self, ns: str, key: str) -> str | None:
+        """Fetch and parse /kv/<ns>/<key>."""
+        path = f"/kv/{ns}/{key}"
+        status, body, _ = self._request(path)
+        if status == 200 and isinstance(body, str):
+            return parse_note_value(body)
+        return None
+
+    def set_note_unsigned(self, ns: str, key: str, value: str) -> bool:
+        """Generic KV notes are world-writable and unsigned."""
+        payload = json.dumps({"value": value}).encode("utf-8")
+        path = f"/kv/{ns}/{key}?format=json"
         status, _, _ = self._request(
             path,
             method="POST",
@@ -182,20 +269,20 @@ class AgentClient:
         if_absent: bool = False,
         expect: str | None = None,
     ) -> bool:
-        """Write a note with Compare-And-Swap (CAS) concurrency gating."""
-        swept_val = sanitize_single_line(value)
+        """Write a note with Compare-And-Swap (CAS) gating."""
+        canonical_val = canonical_sweep(value)
         nonce = self.next_nonce()
-        canonical = f"{ns}|{key}|{nonce}|{swept_val}"
-        sig = self.sign(canonical)
+        canonical_payload = f"{ns}|{key}|{nonce}|{canonical_val}"
+        sig = self.sign(canonical_payload)
 
-        query: dict[str, str | int] = {}
+        query: dict[str, str | int] = {"format": "json"}
         if if_absent:
             query["if_absent"] = 1
         elif expect is not None:
             query["if"] = expect
 
-        query_str = f"?{urllib.parse.urlencode(query)}" if query else ""
-        encoded_val = urllib.parse.quote(swept_val)
+        query_str = f"?{urllib.parse.urlencode(query)}"
+        encoded_val = urllib.parse.quote(canonical_val)
         path = f"/kv/{ns}/{key}/set-signed/{self.did}/{sig}/{nonce}/{encoded_val}{query_str}"
 
         status, _, _ = self._request(path)

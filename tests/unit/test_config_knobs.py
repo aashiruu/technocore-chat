@@ -313,3 +313,26 @@ def test_junk_in_the_poll_interval_refuses_to_boot() -> None:
             env={**clean, "CHAT_WAIT_POLL": raw},
         )
         assert run.returncode != 0, f"CHAT_WAIT_POLL={raw!r} booted"
+
+
+def test_override_mirrors_to_limit_module() -> None:
+    """Knobs extracted to limit (MAX_WAITERS_TOTAL, MAX_WAITERS_PER_IP) must mirror
+
+    into limit when overridden, matching the behavior for app and store.
+    """
+    import app
+    import config
+    import limit
+
+    orig_config = config.MAX_WAITERS_TOTAL
+    orig_limit = limit.MAX_WAITERS_TOTAL
+    orig_app = app.MAX_WAITERS_TOTAL
+
+    with config.override(MAX_WAITERS_TOTAL=1337):
+        assert config.MAX_WAITERS_TOTAL == 1337
+        assert app.MAX_WAITERS_TOTAL == 1337
+        assert limit.MAX_WAITERS_TOTAL == 1337
+
+    assert config.MAX_WAITERS_TOTAL == orig_config
+    assert app.MAX_WAITERS_TOTAL == orig_app
+    assert limit.MAX_WAITERS_TOTAL == orig_limit

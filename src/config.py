@@ -348,12 +348,12 @@ _NOT_THERE = object()
 def override(**kwargs):
     """Re-bind named knobs for the body of the `with`, then restore them — always.
 
-    app and store re-bind these knobs into their own namespaces at import (handlers and
+    app, store and limit re-bind these knobs into their own namespaces at import (handlers and
     tests read them there, and monkeypatch.setattr(app, ...) expects to find them), so a
-    binding made here is mirrored into both when they are already loaded, and every copy
+    binding made here is mirrored into all when they are already loaded, and every copy
     is restored on exit.
     """
-    mods = [sys.modules[__name__]] + [sys.modules[n] for n in ("app", "store") if n in sys.modules]
+    mods = [sys.modules[n] for n in (__name__, "app", "store", "limit") if n in sys.modules]
     saved = [(mod, name, mod.__dict__.get(name, _NOT_THERE)) for mod in mods for name in kwargs]
     for mod, name, _ in saved:
         setattr(mod, name, kwargs[name])

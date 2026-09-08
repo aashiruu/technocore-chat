@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import email.message
 import io
 import stat
@@ -139,6 +140,31 @@ def test_agent_key_atomic_file_permissions(tmp_path: Path) -> None:
 
     agent2 = AgentClient.load_or_create_key(key_file)
     assert agent2.did == agent1.did
+
+
+def test_concurrent_key_creation_converges(tmp_path: Path) -> None:
+    key_file = tmp_path / "shared" / "agent.pem"
+
+    def creator() -> str:
+        agent = AgentClient.load_or_create_key(key_file)
+        return agent.did
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(creator) for _ in range(4)]
+        dids = [f.result() for f in futures]
+
+    # All concurrent creators must converge on the exact same persisted DID
+    assert len(set(dids)) == 1
+    assert key_file.exists()
+
+    # File permissions must remain 0o600
+    mode = stat.S_IMODE(key_file.stat().st_mode)
+    assert mode == 0o600
+    assert (mode & 0o077) == 0
+
+    # Reading file directly yields identical DID
+    reloaded = AgentClient.load_or_create_key(key_file)
+    assert reloaded.did == dids[0]
 
 
 def test_parse_note_value_structural_budget_footer() -> None:

@@ -103,30 +103,66 @@ class AgentClient:
     def load_or_create_key(
         cls, key_path: str | Path, base_url: str = "https://technocore.chat"
     ) -> AgentClient:
-        """Loads private key from disk or atomically creates it with 0o600 permissions."""
+        """Loads private key from disk or atomically creates it with 0o600 permissions.
+
+        Uses exclusive atomic creation (O_CREAT | O_EXCL) so that concurrent startup
+        races result in a single winner writing the key and losers reading the winner's
+        persisted file, ensuring all processes converge on the same identity.
+        """
         path = Path(key_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 1. Try reading if it already exists
         if path.exists():
             pem_bytes = path.read_bytes()
-            key = serialization.load_pem_private_key(pem_bytes, password=None)
-            if not isinstance(key, Ed25519PrivateKey):
-                raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
-            return cls(base_url=base_url, private_key=key)
+            if pem_bytes:
+                key = serialization.load_pem_private_key(pem_bytes, password=None)
+                if not isinstance(key, Ed25519PrivateKey):
+                    raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
+                return cls(base_url=base_url, private_key=key)
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        key = Ed25519PrivateKey.generate()
-        pem_bytes = key.private_bytes(
+        # 2. Generate candidate key
+        candidate_key = Ed25519PrivateKey.generate()
+        pem_bytes = candidate_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(path, flags, 0o600)
-        with open(fd, "wb") as f:
-            f.write(pem_bytes)
-        os.chmod(path, 0o600)
+        # 3. Attempt exclusive creation to establish single-winner
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            # Loser: Another process created the file first; wait briefly and read it
+            for _ in range(50):
+                if path.exists() and path.stat().st_size > 0:
+                    try:
+                        read_bytes = path.read_bytes()
+                        key = serialization.load_pem_private_key(read_bytes, password=None)
+                        if isinstance(key, Ed25519PrivateKey):
+                            return cls(base_url=base_url, private_key=key)
+                    except Exception:
+                        pass
+                time.sleep(0.02)
+            # Final fallback read
+            read_bytes = path.read_bytes()
+            key = serialization.load_pem_private_key(read_bytes, password=None)
+            if not isinstance(key, Ed25519PrivateKey):
+                raise ValueError(f"Key at {path} is not an Ed25519PrivateKey") from None
+            return cls(base_url=base_url, private_key=key)
 
-        return cls(base_url=base_url, private_key=key)
+        # Winner: write bytes and close fd
+        try:
+            with open(fd, "wb") as f:
+                f.write(pem_bytes)
+        except Exception:
+            # Clean up on write failure so losers aren't stranded
+            if path.exists():
+                path.unlink(missing_ok=True)
+            raise
+
+        return cls(base_url=base_url, private_key=candidate_key)
 
     def next_nonce(self) -> int:
         self._nonce += 1

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from starlette.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -293,3 +294,66 @@ def test_load_existing_key_refuses_permissive_modes(tmp_path: Path) -> None:
     key_file.chmod(0o600)
     reloaded = AgentClient.load_or_create_key(key_file)
     assert reloaded.did == agent.did
+
+
+def test_nonce_sidecar_creation_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Initial creation of .nonce sidecar must fsync both the file and parent directory."""
+    import os
+
+    fsync_calls: list[int] = []
+    orig_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        orig_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", tracking_fsync)
+    key_file = tmp_path / "nonce_durable" / "agent.pem"
+    agent = AgentClient.load_or_create_key(key_file)
+
+    # First allocation creates the sidecar and must fsync file + parent directory
+    fsync_calls.clear()
+    nonce1 = agent.next_nonce()
+    assert nonce1 > 0
+    assert len(fsync_calls) >= 2, "Initial nonce sidecar creation must fsync file and directory"
+
+    # Subsequent allocation against existing file only fsyncs the file descriptor
+    fsync_calls.clear()
+    nonce2 = agent.next_nonce()
+    assert nonce2 > nonce1
+    assert len(fsync_calls) == 1, "Existing nonce sidecar update only fsyncs the file"
+
+
+def test_key_creation_race_loser_rejects_permissive_winner_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If winner file has unsafe permissions, loser path must fail closed with PermissionError."""
+    import os
+
+    key_file = tmp_path / "race_insecure" / "agent.pem"
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Simulate an existing winner key created with unsafe 0o644 mode
+    candidate_key = AgentClient().private_key
+    pem_bytes = candidate_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    key_file.write_bytes(pem_bytes)
+    key_file.chmod(0o644)
+
+    # Force os.open to raise FileExistsError to trigger the loser branch
+    orig_open = os.open
+
+    def failing_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if str(path) == str(key_file) and (flags & os.O_EXCL):
+            raise FileExistsError(f"{key_file} exists")
+        return orig_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", failing_open)
+
+    with pytest.raises(PermissionError, match="unsafe permissions"):
+        AgentClient.load_or_create_key(key_file)

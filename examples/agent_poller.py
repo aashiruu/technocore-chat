@@ -109,6 +109,21 @@ class AgentClient:
         self.reads_left: int | None = None
         self.read_budget: int | None = None
 
+    @staticmethod
+    def _read_and_validate_key(path: Path) -> Ed25519PrivateKey:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077 != 0:
+            raise PermissionError(
+                f"Key file {path} has unsafe permissions {oct(mode)}; must not be group/world accessible"
+            )
+        pem_bytes = path.read_bytes()
+        if not pem_bytes:
+            raise ValueError(f"Key file {path} is empty")
+        key = serialization.load_pem_private_key(pem_bytes, password=None)
+        if not isinstance(key, Ed25519PrivateKey):
+            raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
+        return key
+
     @classmethod
     def load_or_create_key(
         cls, key_path: str | Path, base_url: str = "https://technocore.chat"
@@ -124,19 +139,10 @@ class AgentClient:
         path.parent.mkdir(parents=True, exist_ok=True)
         nonce_file = path.with_suffix(".nonce")
 
-        # 1. Try reading if it already exists
-        if path.exists():
-            mode = stat.S_IMODE(path.stat().st_mode)
-            if mode & 0o077 != 0:
-                raise PermissionError(
-                    f"Key file {path} has unsafe permissions {oct(mode)}; must not be group/world accessible"
-                )
-            pem_bytes = path.read_bytes()
-            if pem_bytes:
-                key = serialization.load_pem_private_key(pem_bytes, password=None)
-                if not isinstance(key, Ed25519PrivateKey):
-                    raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
-                return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
+        # 1. Try reading if it already exists and has content
+        if path.exists() and path.stat().st_size > 0:
+            key = cls._read_and_validate_key(path)
+            return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
 
         # 2. Generate candidate key
         candidate_key = Ed25519PrivateKey.generate()
@@ -152,21 +158,18 @@ class AgentClient:
             fd = os.open(path, flags, 0o600)
         except FileExistsError:
             # Loser: Another process created the file first; wait briefly and read it
-            for _ in range(50):
+            for _ in range(100):
                 if path.exists() and path.stat().st_size > 0:
                     try:
-                        read_bytes = path.read_bytes()
-                        key = serialization.load_pem_private_key(read_bytes, password=None)
-                        if isinstance(key, Ed25519PrivateKey):
-                            return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
+                        key = cls._read_and_validate_key(path)
+                        return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
+                    except PermissionError:
+                        raise
                     except Exception:
                         pass
                 time.sleep(0.02)
-            # Final fallback read
-            read_bytes = path.read_bytes()
-            key = serialization.load_pem_private_key(read_bytes, password=None)
-            if not isinstance(key, Ed25519PrivateKey):
-                raise ValueError(f"Key at {path} is not an Ed25519PrivateKey") from None
+            # Final fallback read through uniform validator
+            key = cls._read_and_validate_key(path)
             return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
 
         # Winner: write bytes, flush, fsync file and parent directory
@@ -197,6 +200,7 @@ class AgentClient:
 
         When backed by nonce_path, coordinates across concurrent processes using an
         exclusive file lock and fsync, preventing replay rejections under identity reuse.
+        On initial sidecar creation, the containing directory is also fsynced.
         """
         now_ms = int(time.time() * 1000)
         if self.nonce_path is None:
@@ -205,6 +209,7 @@ class AgentClient:
 
         # Coordinated cross-process monotonic allocation
         self.nonce_path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not self.nonce_path.exists()
         fd = os.open(self.nonce_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -218,6 +223,17 @@ class AgentClient:
                     f.truncate()
                     f.flush()
                     os.fsync(fd)
+
+                    if is_new:
+                        try:
+                            dir_fd = os.open(str(self.nonce_path.parent), os.O_RDONLY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except OSError:
+                            pass
+
                     return allocated
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -368,7 +384,10 @@ class AgentClient:
         expect: str | None = None,
     ) -> bool:
         """Write a note with Compare-And-Swap (CAS) gating."""
-        canonical_val = canonical_sweep(value)
+        try:
+            canonical_val = canonical_sweep(value)
+        except ValueError:
+            return False
         nonce = self.next_nonce()
         canonical_payload = f"{ns}|{key}|{nonce}|{canonical_val}"
         sig = self.sign(canonical_payload)

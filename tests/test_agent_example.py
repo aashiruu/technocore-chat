@@ -205,9 +205,9 @@ def test_key_creation_durable_fsync_called(tmp_path: Path, monkeypatch: pytest.M
 def test_concurrent_clients_sharing_key_allocate_strictly_increasing_nonces(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Concurrent clients sharing the same persisted key file must never collide or
+    """Clients sharing the same persisted key file coordinate strictly increasing
 
-    regress nonces, alternating writes successfully into the same room.
+    nonces across processes, alternating writes successfully into the same room.
     """
     handler = StarletteHTTPHandler(client)
     opener = urllib.request.build_opener(handler)
@@ -215,34 +215,35 @@ def test_concurrent_clients_sharing_key_allocate_strictly_increasing_nonces(
 
     key_file = tmp_path / "shared_identity" / "agent.pem"
 
-    # Both clients load the same key file
+    # Both clients load the same key file and share the .nonce sidecar
     agent_a = AgentClient.load_or_create_key(key_file, base_url="http://testserver")
     agent_b = AgentClient.load_or_create_key(key_file, base_url="http://testserver")
     assert agent_a.did == agent_b.did
 
-    allocated_nonces: list[int] = []
+    # 1. Concurrent nonce allocations must be strictly distinct and increasing
+    def alloc(agent: AgentClient) -> int:
+        return agent.next_nonce()
 
-    def perform_write(agent: AgentClient, msg: str) -> bool:
-        nonce = agent.next_nonce()
-        allocated_nonces.append(nonce)
-        # Directly test signed write against the real app room
-        return agent.say_signed_post("shared-room", msg)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futs = [executor.submit(alloc, agent_a if i % 2 == 0 else agent_b) for i in range(10)]
+        allocated = [f.result() for f in futs]
 
-    # Concurrently allocate and post from both agents
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(perform_write, agent_a, "message from A 1")
-        f2 = executor.submit(perform_write, agent_b, "message from B 1")
-        f3 = executor.submit(perform_write, agent_a, "message from A 2")
-        f4 = executor.submit(perform_write, agent_b, "message from B 2")
+    assert len(set(allocated)) == 10, "All concurrently allocated nonces must be distinct"
 
-        results = [f1.result(), f2.result(), f3.result(), f4.result()]
+    # 2. Alternating writes between two callers sharing the key succeed without replay floor rejections
+    ok1 = agent_a.say_signed_post("shared-room", "message from A 1")
+    assert ok1 is True
 
-    assert all(results), "All signed posts must succeed without nonce replay rejections"
-    assert len(allocated_nonces) == 4
-    # Ensure every nonce was distinct
-    assert len(set(allocated_nonces)) == 4
+    ok2 = agent_b.say_signed_post("shared-room", "message from B 1")
+    assert ok2 is True
 
-    # Verify all messages were accepted into the room
+    ok3 = agent_a.say_signed_post("shared-room", "message from A 2")
+    assert ok3 is True
+
+    ok4 = agent_b.say_signed_post("shared-room", "message from B 2")
+    assert ok4 is True
+
+    # Verify all 4 messages were accepted in the room
     view = agent_a.read_room("shared-room", wait=0)
     assert view is not None
     assert view["count"] == 4

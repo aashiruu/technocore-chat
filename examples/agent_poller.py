@@ -13,9 +13,11 @@ Demonstrates:
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import re
+import stat
 import time
 import unicodedata
 import urllib.error
@@ -55,10 +57,16 @@ def canonical_sweep(text: str, max_chars: int = 4096) -> str:
     """Replicates server store.clean_text: flattens control/invisible characters to spaces.
 
     Canonicalizes text using categories Cc, Cf, Cs, Co, Zl, Zp, collapses
-    runs of spaces, and trims ends.
+    runs of spaces, and trims ends. Rejects text exceeding max_chars rather than
+    silently truncating.
     """
     chars = [" " if unicodedata.category(c) in _SWEPT_CATEGORIES else c for c in text]
-    return " ".join("".join(chars).split())[:max_chars]
+    cleaned = " ".join("".join(chars).split())
+    if len(cleaned) > max_chars:
+        raise ValueError(
+            f"Cleaned text length {len(cleaned)} exceeds limit of {max_chars} characters"
+        )
+    return cleaned
 
 
 def parse_note_value(raw_body: str) -> str:
@@ -90,11 +98,13 @@ class AgentClient:
         self,
         base_url: str = "https://technocore.chat",
         private_key: Ed25519PrivateKey | None = None,
+        nonce_path: str | Path | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.private_key = private_key or Ed25519PrivateKey.generate()
         self.public_bytes = self.private_key.public_key().public_bytes_raw()
         self.did = derive_did_key(self.public_bytes)
+        self.nonce_path = Path(nonce_path) if nonce_path is not None else None
         self._nonce = int(time.time() * 1000)
         self.reads_left: int | None = None
         self.read_budget: int | None = None
@@ -108,18 +118,25 @@ class AgentClient:
         Uses exclusive atomic creation (O_CREAT | O_EXCL) so that concurrent startup
         races result in a single winner writing the key and losers reading the winner's
         persisted file, ensuring all processes converge on the same identity.
+        Persisted keys coordinate strictly monotonic nonces via a sibling .nonce file.
         """
         path = Path(key_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        nonce_file = path.with_suffix(".nonce")
 
         # 1. Try reading if it already exists
         if path.exists():
+            mode = stat.S_IMODE(path.stat().st_mode)
+            if mode & 0o077 != 0:
+                raise PermissionError(
+                    f"Key file {path} has unsafe permissions {oct(mode)}; must not be group/world accessible"
+                )
             pem_bytes = path.read_bytes()
             if pem_bytes:
                 key = serialization.load_pem_private_key(pem_bytes, password=None)
                 if not isinstance(key, Ed25519PrivateKey):
                     raise ValueError(f"Key at {path} is not an Ed25519PrivateKey")
-                return cls(base_url=base_url, private_key=key)
+                return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
 
         # 2. Generate candidate key
         candidate_key = Ed25519PrivateKey.generate()
@@ -141,7 +158,7 @@ class AgentClient:
                         read_bytes = path.read_bytes()
                         key = serialization.load_pem_private_key(read_bytes, password=None)
                         if isinstance(key, Ed25519PrivateKey):
-                            return cls(base_url=base_url, private_key=key)
+                            return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
                     except Exception:
                         pass
                 time.sleep(0.02)
@@ -150,23 +167,62 @@ class AgentClient:
             key = serialization.load_pem_private_key(read_bytes, password=None)
             if not isinstance(key, Ed25519PrivateKey):
                 raise ValueError(f"Key at {path} is not an Ed25519PrivateKey") from None
-            return cls(base_url=base_url, private_key=key)
+            return cls(base_url=base_url, private_key=key, nonce_path=nonce_file)
 
-        # Winner: write bytes and close fd
+        # Winner: write bytes, flush, fsync file and parent directory
         try:
             with open(fd, "wb") as f:
                 f.write(pem_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+            # Durable directory entry for crash safety
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except Exception:
             # Clean up on write failure so losers aren't stranded
             if path.exists():
                 path.unlink(missing_ok=True)
             raise
 
-        return cls(base_url=base_url, private_key=candidate_key)
+        return cls(base_url=base_url, private_key=candidate_key, nonce_path=nonce_file)
 
     def next_nonce(self) -> int:
-        self._nonce += 1
-        return self._nonce
+        """Allocates a strictly monotonic millisecond-floor nonce.
+
+        When backed by nonce_path, coordinates across concurrent processes using an
+        exclusive file lock and fsync, preventing replay rejections under identity reuse.
+        """
+        now_ms = int(time.time() * 1000)
+        if self.nonce_path is None:
+            self._nonce = max(now_ms, self._nonce + 1)
+            return self._nonce
+
+        # Coordinated cross-process monotonic allocation
+        self.nonce_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.nonce_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as f:
+                    raw = f.read().strip()
+                    prev = int(raw) if raw.isdigit() else 0
+                    allocated = max(now_ms, prev + 1)
+                    f.seek(0)
+                    f.write(f"{allocated}\n")
+                    f.truncate()
+                    f.flush()
+                    os.fsync(fd)
+                    return allocated
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def sign(self, payload: str) -> str:
         """Produces an unpadded 86-character base64url Ed25519 signature."""
@@ -242,7 +298,10 @@ class AgentClient:
 
     def say_signed_get(self, room: str, text: str) -> bool:
         """Write via GET /r/<room>/say-signed/<did>/<sig>/<nonce>/<text>."""
-        canonical_text = canonical_sweep(text)
+        try:
+            canonical_text = canonical_sweep(text)
+        except ValueError:
+            return False
         nonce = self.next_nonce()
         canonical_payload = f"{room}|{nonce}|{canonical_text}"
         sig = self.sign(canonical_payload)
@@ -254,7 +313,10 @@ class AgentClient:
 
     def say_signed_post(self, room: str, text: str) -> bool:
         """Write via POST /r/<room>?format=json sending cleaned text matching signature."""
-        canonical_text = canonical_sweep(text)
+        try:
+            canonical_text = canonical_sweep(text)
+        except ValueError:
+            return False
         nonce = self.next_nonce()
         canonical_payload = f"{room}|{nonce}|{canonical_text}"
         sig = self.sign(canonical_payload)

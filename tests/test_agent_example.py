@@ -180,3 +180,115 @@ def test_parse_note_value_structural_budget_footer() -> None:
         "# budget: 2 of 30 reads left this minute (refills 0.5/s)"
     )
     assert parse_note_value(raw_with_footer) == "# budget: user state"
+
+
+def test_key_creation_durable_fsync_called(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that key creation flushes and fsyncs both the file and parent directory."""
+    import os
+
+    fsync_calls: list[int] = []
+    orig_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        orig_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", tracking_fsync)
+    key_file = tmp_path / "durable" / "agent.pem"
+    agent = AgentClient.load_or_create_key(key_file)
+
+    assert agent.did.startswith("did:key:z6Mk")
+    # At least the file descriptor and the parent directory must be fsync'd
+    assert len(fsync_calls) >= 2
+
+
+def test_concurrent_clients_sharing_key_allocate_strictly_increasing_nonces(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent clients sharing the same persisted key file must never collide or
+
+    regress nonces, alternating writes successfully into the same room.
+    """
+    handler = StarletteHTTPHandler(client)
+    opener = urllib.request.build_opener(handler)
+    monkeypatch.setattr(urllib.request, "urlopen", opener.open)
+
+    key_file = tmp_path / "shared_identity" / "agent.pem"
+
+    # Both clients load the same key file
+    agent_a = AgentClient.load_or_create_key(key_file, base_url="http://testserver")
+    agent_b = AgentClient.load_or_create_key(key_file, base_url="http://testserver")
+    assert agent_a.did == agent_b.did
+
+    allocated_nonces: list[int] = []
+
+    def perform_write(agent: AgentClient, msg: str) -> bool:
+        nonce = agent.next_nonce()
+        allocated_nonces.append(nonce)
+        # Directly test signed write against the real app room
+        return agent.say_signed_post("shared-room", msg)
+
+    # Concurrently allocate and post from both agents
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(perform_write, agent_a, "message from A 1")
+        f2 = executor.submit(perform_write, agent_b, "message from B 1")
+        f3 = executor.submit(perform_write, agent_a, "message from A 2")
+        f4 = executor.submit(perform_write, agent_b, "message from B 2")
+
+        results = [f1.result(), f2.result(), f3.result(), f4.result()]
+
+    assert all(results), "All signed posts must succeed without nonce replay rejections"
+    assert len(allocated_nonces) == 4
+    # Ensure every nonce was distinct
+    assert len(set(allocated_nonces)) == 4
+
+    # Verify all messages were accepted into the room
+    view = agent_a.read_room("shared-room", wait=0)
+    assert view is not None
+    assert view["count"] == 4
+
+
+def test_oversized_message_refused_without_silent_truncation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler = StarletteHTTPHandler(client)
+    opener = urllib.request.build_opener(handler)
+    monkeypatch.setattr(urllib.request, "urlopen", opener.open)
+
+    agent = AgentClient(base_url="http://testserver")
+
+    oversized_text = "a" * 4097
+    with pytest.raises(ValueError, match="exceeds limit"):
+        canonical_sweep(oversized_text)
+
+    ok = agent.say_signed_post("lobby", oversized_text)
+    assert ok is False
+
+    # Room must remain empty / unaffected
+    view = agent.read_room("lobby", wait=0)
+    assert view is not None
+    assert view["count"] == 0
+
+
+def test_load_existing_key_refuses_permissive_modes(tmp_path: Path) -> None:
+    """load_or_create_key must fail closed if an existing key has group or world permissions."""
+    key_file = tmp_path / "insecure" / "agent.pem"
+    agent = AgentClient.load_or_create_key(key_file)
+    assert agent.did.startswith("did:key:z6Mk")
+
+    # Widen permissions to 0o644 (world readable)
+    key_file.chmod(0o644)
+
+    with pytest.raises(PermissionError, match="unsafe permissions"):
+        AgentClient.load_or_create_key(key_file)
+
+    # Widen permissions to 0o640 (group readable)
+    key_file.chmod(0o640)
+
+    with pytest.raises(PermissionError, match="unsafe permissions"):
+        AgentClient.load_or_create_key(key_file)
+
+    # Restoring 0o600 succeeds
+    key_file.chmod(0o600)
+    reloaded = AgentClient.load_or_create_key(key_file)
+    assert reloaded.did == agent.did

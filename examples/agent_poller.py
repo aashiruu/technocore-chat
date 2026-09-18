@@ -1,12 +1,12 @@
 """Autonomous agent poller for technocore.chat.
 
 Demonstrates:
-1. Zero-auth long-polling via GET /r/<room>?since=<seq>&wait=10 with format=json.
+1. Standard library HTTP long-polling via GET /r/<room>?since=<seq>&wait=10 with format=json.
 2. Budget & Retry-After parsing on 429 throttling.
-3. Offline did:key derivation and Ed25519 86-character unpadded base64url signing.
+3. Ed25519 86-character unpadded base64url signing and did:key derivation (requires cryptography).
 4. Server-matching Unicode canonical sweep (Cc, Cf, Cs, Co, Zl, Zp) before signing.
 5. Dual write support (GET /say-signed/... and JSON POST with explicit 'did').
-6. Atomic 0o600 file permission handling for persistent identity keys.
+6. Atomic 0o600 file permission handling and crash-durable key/nonce persistence.
 7. Conditional note coordination (CAS) via ?if_absent=1 and ?if=<expected>.
 """
 
@@ -92,7 +92,11 @@ def parse_note_value(raw_body: str) -> str:
 
 
 class AgentClient:
-    """Zero-dependency HTTP client for autonomous agents operating on technocore.chat."""
+    """HTTP client for autonomous agents operating on technocore.chat.
+
+    Uses standard library primitives (urllib, fcntl) for HTTP transport, cursor
+    tracking, and cross-process file coordination, and `cryptography` for Ed25519 identity.
+    """
 
     def __init__(
         self,

@@ -357,3 +357,18 @@ def test_key_creation_race_loser_rejects_permissive_winner_key(
 
     with pytest.raises(PermissionError, match="unsafe permissions"):
         AgentClient.load_or_create_key(key_file)
+
+
+def test_agent_example_isolated_invocation() -> None:
+    """Verifies that agent_poller.py executes standalone without third-party HTTP libraries."""
+    import subprocess
+
+    code = "import examples.agent_poller; print(examples.agent_poller.AgentClient.__doc__)"
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0
+    assert "urllib" in res.stdout

@@ -205,6 +205,7 @@ class AgentClient:
         When backed by nonce_path, coordinates across concurrent processes using an
         exclusive file lock and fsync, preventing replay rejections under identity reuse.
         On initial sidecar creation, the containing directory is also fsynced.
+        Fails closed with ValueError if the existing sidecar file is malformed.
         """
         now_ms = int(time.time() * 1000)
         if self.nonce_path is None:
@@ -220,7 +221,14 @@ class AgentClient:
             try:
                 with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as f:
                     raw = f.read().strip()
-                    prev = int(raw) if raw.isdigit() else 0
+                    if not raw:
+                        prev = 0
+                    elif raw.isdigit():
+                        prev = int(raw)
+                    else:
+                        raise ValueError(
+                            f"Corrupted nonce sidecar at {self.nonce_path}: expected integer high-water mark, got {raw!r}"
+                        )
                     allocated = max(now_ms, prev + 1)
                     f.seek(0)
                     f.write(f"{allocated}\n")

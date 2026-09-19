@@ -372,3 +372,21 @@ def test_agent_example_isolated_invocation() -> None:
     )
     assert res.returncode == 0
     assert "urllib" in res.stdout
+
+
+def test_corrupted_nonce_sidecar_fails_closed(tmp_path: Path) -> None:
+    """Non-empty corrupted or non-digit nonce sidecar must raise ValueError rather than resetting."""
+    key_file = tmp_path / "corrupted_nonce" / "agent.pem"
+    agent = AgentClient.load_or_create_key(key_file)
+    assert agent.nonce_path is not None
+
+    # Write corrupted/non-digit content to the sidecar
+    agent.nonce_path.write_text("not-a-number\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Corrupted nonce sidecar"):
+        agent.next_nonce()
+
+    # Empty content is treated as fresh sidecar and recovers cleanly
+    agent.nonce_path.write_text("", encoding="utf-8")
+    recovered = agent.next_nonce()
+    assert recovered > 0
